@@ -106,7 +106,7 @@ class PlexSync:
 				password=self.options.passwd,
 				token=self.options.token
 			)
-			self.destination_player.connect()
+			self.destination_player.connect(db_path=getattr(self.options, 'db_path', None))
 		else:
 			self.destination_player.connect(
 				server=self.options.server,
@@ -114,7 +114,7 @@ class PlexSync:
 				password=self.options.passwd,
 				token=self.options.token
 			)
-			self.source_player.connect()
+			self.source_player.connect(db_path=getattr(self.options, 'db_path', None))
 
 		for sync_item in self.options.sync:
 			if sync_item.lower() == "tracks":
@@ -222,6 +222,7 @@ def parse_args():
 	parser.add_argument('--log', default='info', help='Sets the logging level')
 	parser.add_argument('--passwd', type=str, help='The password for the plex user. NOT RECOMMENDED TO USE!')
 	parser.add_argument('--player', default='MediaMonkey', type=str, help='Media player to synchronize with Plex')
+	parser.add_argument('--db-path', '--db_path', type=str, dest='db_path', help='Path to MediaMonkey database (MM.DB). Auto-detected if not specified.')
 	parser.add_argument('--server', type=str, required=True, help='The name of the plex media server')
 	parser.add_argument('--username', type=str, required=True, help='The plex username')
 	parser.add_argument('--token', type=str, help='Plex API token.  See https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/ for information on how to find your token')

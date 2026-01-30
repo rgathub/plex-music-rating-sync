@@ -135,7 +135,9 @@ class MediaMonkey(MediaPlayer):
 	def __init__(self):
 		super(MediaMonkey, self).__init__()
 		self.logger = logging.getLogger('PlexSync.MediaMonkey')
-		self.sdb = None
+		self.conn = None
+		self.cursor = None
+		self.db_path = None
 
 	@staticmethod
 	def name():
@@ -146,14 +148,57 @@ class MediaMonkey(MediaPlayer):
 		# TODO maybe makes more sense to create a track class and make utility functions for __str__, artist, album, title, etc
 		return ' - '.join([track.artist, track.album, track.title])
 
-	def connect(self, *args):
-		self.logger.info('Connecting to local player {}'.format(self.name()))
-		import win32com.client
+	def connect(self, db_path=None, *args, **kwargs):
+		"""
+		Connect to MediaMonkey database
+		:param db_path: Path to MM.DB file. If None, attempts to auto-detect.
+		"""
+		self.logger.info('Connecting to local player {} database'.format(self.name()))
+		import sqlite3
+		import os
+		
+		# Auto-detect database location if not provided
+		if db_path is None:
+			# Try MediaMonkey 5.x location
+			appdata = os.getenv('APPDATA')
+			if appdata:
+				mm5_path = os.path.join(appdata, 'MediaMonkey5', 'MM5.DB')
+				if os.path.exists(mm5_path):
+					db_path = mm5_path
+					self.logger.info('Found MediaMonkey 5.x database at: {}'.format(db_path))
+			
+			# Try MediaMonkey 4.x location if 5.x not found
+			if db_path is None:
+				if appdata:
+					mm4_path = os.path.join(appdata, 'MediaMonkey', 'MM.DB')
+					if os.path.exists(mm4_path):
+						db_path = mm4_path
+						self.logger.info('Found MediaMonkey 4.x database at: {}'.format(db_path))
+				
+		
+		if db_path is None or not os.path.exists(db_path):
+			self.logger.error('MediaMonkey database not found. Please specify the path with --db-path.')
+			self.logger.error('Typical locations:')
+			self.logger.error('  MediaMonkey 4.x: %APPDATA%\\MediaMonkey\\MM.DB')
+			self.logger.error('  MediaMonkey 5.x: %LOCALAPPDATA%\\MediaMonkey\\DB\\MM.DB')
+			exit(1)
+		
 		try:
-			self.sdb = win32com.client.Dispatch("SongsDB.SDBApplication")
-			self.sdb.ShutdownAfterDisconnect = False
-		except Exception:
-			self.logger.error('No scripting interface to MediaMonkey can be found. Exiting...')
+			self.db_path = db_path
+			# Open in read-only mode to prevent corruption and allow concurrent access
+			uri = 'file:{}?mode=ro'.format(db_path.replace('\\', '/'))
+			self.conn = sqlite3.connect(uri, uri=True)
+			self.conn.row_factory = sqlite3.Row  # Access columns by name
+			self.cursor = self.conn.cursor()
+			self.logger.info('Successfully connected to MediaMonkey database')
+			
+			# Verify database structure
+			self.cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='Songs'")
+			if not self.cursor.fetchone():
+				self.logger.error('Invalid MediaMonkey database: Songs table not found')
+				exit(1)
+		except Exception as e:
+			self.logger.error('Failed to connect to MediaMonkey database: {}'.format(e))
 			exit(1)
 
 	def create_playlist(self, title, tracks):
@@ -162,81 +207,215 @@ class MediaMonkey(MediaPlayer):
 	def find_playlist(self, **nargs):
 		raise NotImplementedError
 
-	def read_child_playlists(self, parent_playlist):
+	def read_child_playlists(self, parent_id, parent_name=''):
 		"""
+		Recursively read child playlists from database
+		:param parent_id: Parent playlist ID (-1 for root)
+		:param parent_name: Parent playlist name for hierarchy
 		:rtype: list<Playlist>
 		"""
 		playlists = []
-		for i in range(len(parent_playlist.ChildPlaylists)):
-			_playlist = parent_playlist.ChildPlaylists[i]
-			playlist = Playlist(_playlist.Title, parent_name=parent_playlist.Title)
+		
+		# Query child playlists
+		query = """
+			SELECT IDPlaylist, PlaylistName, isAutoPlaylist
+			FROM Playlists
+			WHERE ParentPlaylist = ?
+			ORDER BY PlaylistName
+		"""
+		self.cursor.execute(query, (parent_id,))
+		
+		for row in self.cursor.fetchall():
+			playlist_id = row['IDPlaylist']
+			playlist_name = row['PlaylistName']
+			is_auto = bool(row['isAutoPlaylist'])
+			
+			playlist = Playlist(playlist_name, parent_name=parent_name)
+			playlist.is_auto_playlist = is_auto
 			playlists.append(playlist)
-			playlist.is_auto_playlist = _playlist.isAutoplaylist
-			if playlist.is_auto_playlist:
+			
+			if is_auto:
 				self.logger.debug('Skipping to read tracks for auto playlist {}'.format(playlist.name))
-				continue
-
-			for j in range(_playlist.Tracks.Count):
-				playlist.tracks.append(self.read_track_metadata(_playlist.Tracks[j]))
-
-			if len(_playlist.ChildPlaylists):
-				playlists.extend(self.read_child_playlists(_playlist))
-
+			else:
+				# Read tracks for this playlist
+				track_query = """
+					SELECT s.ID, s.SongTitle, s.Artist, s.Album, s.TrackNumber, s.Rating, s.SongPath
+					FROM Songs s
+					INNER JOIN PlaylistSongs ps ON s.ID = ps.IDSong
+					WHERE ps.IDPlaylist = ?
+					ORDER BY ps.SongOrder
+				"""
+				self.cursor.execute(track_query, (playlist_id,))
+				for track_row in self.cursor.fetchall():
+					playlist.tracks.append(self._row_to_audiotag(track_row))
+			
+			# Recursively read child playlists
+			child_playlists = self.read_child_playlists(playlist_id, playlist.name)
+			playlists.extend(child_playlists)
+		
 		return playlists
 
 	def read_playlists(self):
 		self.logger.info('Reading playlists from the {} player'.format(self.name()))
-		root_playlist = self.sdb.PlaylistByTitle('')
-		playlists = self.read_child_playlists(root_playlist)
+		# Start with root playlists (ParentPlaylist = -1)
+		playlists = self.read_child_playlists(-1)
 		self.logger.info('Found {} playlists'.format(len(playlists)))
 		return playlists
 
-	def read_track_metadata(self, track) -> AudioTag:
-		tag = AudioTag(artist=track.Artist.Name, album=track.Album.Name, title=track.Title, file_path=track.Path)
-		tag.rating = self.get_normed_rating(track.Rating)
-		tag.ID = track.ID
-		tag.track = track.TrackOrder
+	def _row_to_audiotag(self, row) -> AudioTag:
+		"""
+		Convert database row to AudioTag object
+		:param row: sqlite3.Row object
+		:return: AudioTag instance
+		"""
+		artist = row['Artist'] or ''
+		album = row['Album'] or ''
+		title = row['SongTitle'] or ''
+		file_path = row['SongPath'] or ''
+		
+		tag = AudioTag(artist=artist, album=album, title=title, file_path=file_path)
+		tag.rating = self.get_normed_rating(row['Rating'])
+		tag.ID = row['ID']
+		tag.track = row['TrackNumber'] or 0
 		return tag
 
+	def read_track_metadata(self, track) -> AudioTag:
+		"""
+		Read track metadata from database by ID
+		:param track: AudioTag with ID set, or integer ID
+		:return: AudioTag with full metadata
+		"""
+		track_id = track.ID if isinstance(track, AudioTag) else track
+		
+		query = """
+			SELECT ID, SongTitle, Artist, Album, TrackNumber, Rating, SongPath
+			FROM Songs
+			WHERE ID = ?
+		"""
+		self.cursor.execute(query, (track_id,))
+		row = self.cursor.fetchone()
+		
+		if row:
+			return self._row_to_audiotag(row)
+		else:
+			self.logger.warning('Track with ID {} not found in database'.format(track_id))
+			return None
+
 	def search_tracks(self, key: str, value: Union[bool, str]) -> List[AudioTag]:
+		"""
+		Search for tracks in MediaMonkey database
+		:param key: Search mode ('title', 'rating', 'query')
+		:param value: Search value
+		:return: List of matching AudioTag objects
+		"""
 		if not value:
 			raise ValueError(f"value can not be empty.")
+		
+		tags = []
+		
 		if key == "title":
-			title = value.replace('"', r'""')
-			query = f'SongTitle = "{title}"'
+			# Search by exact title
+			query = """
+				SELECT ID, SongTitle, Artist, Album, TrackNumber, Rating, SongPath
+				FROM Songs
+				WHERE SongTitle = ?
+			"""
+			self.logger.debug(f'Searching for tracks with title: {value}')
+			self.cursor.execute(query, (value,))
+			
 		elif key == "rating":
+			# Search by rating
 			if value is True:
-				value = "> 0"
-			query = f'Rating {value}'
-			self.logger.info('Reading tracks from the {} player'.format(self.name()))
+				# Get all rated tracks
+				query = """
+					SELECT ID, SongTitle, Artist, Album, TrackNumber, Rating, SongPath
+					FROM Songs
+					WHERE Rating > 0
+				"""
+				self.logger.info('Reading tracks from the {} player'.format(self.name()))
+				self.cursor.execute(query)
+			else:
+				# Custom rating condition (e.g., "> 50", "= 100")
+				query = f"""
+					SELECT ID, SongTitle, Artist, Album, TrackNumber, Rating, SongPath
+					FROM Songs
+					WHERE Rating {value}
+				"""
+				self.logger.debug(f'Executing rating query: Rating {value}')
+				self.cursor.execute(query)
+				
 		elif key == "query":
-			query = value
+			# Direct SQL query (advanced usage)
+			# Wrap in SELECT from Songs if not already a complete query
+			if not value.strip().upper().startswith('SELECT'):
+				query = f"""
+					SELECT ID, SongTitle, Artist, Album, TrackNumber, Rating, SongPath
+					FROM Songs
+					WHERE {value}
+				"""
+			else:
+				query = value
+			self.logger.debug(f'Executing custom query: {query}')
+			self.cursor.execute(query)
+			
 		else:
 			raise KeyError(f"Invalid search mode {key}.")
-		self.logger.debug(f'Executing query [{query}] against {self.name()}')
-
-		it = self.sdb.Database.QuerySongs(query)
-		tags = []
-		counter = 0
-		while not it.EOF:
-			tags.append(self.read_track_metadata(it.Item))
-			counter += 1
-			it.Next()
-
-		self.logger.info(f'Found {counter} tracks for query {query}.')
+		
+		# Fetch results and convert to AudioTag objects
+		for row in self.cursor.fetchall():
+			tags.append(self._row_to_audiotag(row))
+		
+		self.logger.info(f'Found {len(tags)} tracks.')
 		return tags
 
 	def update_playlist(self, playlist, track, present):
 		raise NotImplementedError
 
 	def update_rating(self, track, rating):
+		"""
+		Update track rating in MediaMonkey database
+		Note: Requires write access - database should not be opened in read-only mode
+		:param track: AudioTag with ID set
+		:param rating: Normalized rating (0-1)
+		"""
 		self.logger.debug('Updating rating of track "{}" to {} stars'.format(
 			self.format(track), self.get_5star_rating(rating))
 		)
 		if not self.dry_run:
-			song = self.sdb.Database.QuerySongs('ID=' + str(track.ID))
-			song.Item.Rating = self.get_native_rating(rating)
-			song.Item.UpdateDB()
+			# Check if database is read-only
+			if 'mode=ro' in str(self.db_path):
+				self.logger.error('Cannot update ratings: database opened in read-only mode')
+				self.logger.error('Restart with write access or close MediaMonkey')
+				return
+			
+			try:
+				# Reopen connection with write access if needed
+				if self.conn and not self.conn.execute("PRAGMA query_only").fetchone()[0] == 0:
+					self.conn.close()
+					self.conn = sqlite3.connect(self.db_path)
+					self.conn.row_factory = sqlite3.Row
+					self.cursor = self.conn.cursor()
+				
+				native_rating = self.get_native_rating(rating)
+				query = """
+					UPDATE Songs
+					SET Rating = ?
+					WHERE ID = ?
+				"""
+				self.cursor.execute(query, (native_rating, track.ID))
+				self.conn.commit()
+				self.logger.debug('Successfully updated rating for track ID {}'.format(track.ID))
+				
+			except sqlite3.OperationalError as e:
+				self.logger.error('Failed to update rating: {} (Is MediaMonkey running?)'.format(e))
+			except Exception as e:
+				self.logger.error('Unexpected error updating rating: {}'.format(e))
+				self.conn.rollback()
+	
+	def __del__(self):
+		"""Close database connection on cleanup"""
+		if hasattr(self, 'conn') and self.conn:
+			self.conn.close()
 
 
 class PlexPlayer(MediaPlayer):
